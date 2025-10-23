@@ -326,6 +326,7 @@ bool register_algo_gate( int algo, algo_gate_t *gate )
     case ALGO_MINOTAUR:     rc = register_minotaur_algo      ( gate ); break;
     case ALGO_MINOTAURX:    rc = register_minotaur_algo      ( gate ); break;
     case ALGO_MYR_GR:       rc = register_myriad_algo        ( gate ); break;
+    case ALGO_NEPTUNE:      rc = register_neptune_algo       ( gate ); break;
     case ALGO_NEOSCRYPT:    rc = register_neoscrypt_algo     ( gate ); break;
     case ALGO_NIST5:        rc = register_nist5_algo         ( gate ); break;
     case ALGO_PENTABLAKE:   rc = register_pentablake_algo    ( gate ); break;
@@ -463,4 +464,3 @@ void get_algo_alias( char** algo_or_alias )
 
 #undef ALIAS
 #undef PROPER
-

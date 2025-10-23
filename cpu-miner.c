@@ -2589,14 +2589,47 @@ static bool stratum_handle_response( char *buf )
    res_val = json_object_get( val, "result" );
    if ( !res_val ) { /* now what? */ }
 
+   // Check if this is a Neptune job (JSON-RPC result with job object)
+   if ( opt_algo == ALGO_NEPTUNE && res_val && json_is_object(res_val) )
+   {
+      json_t *job = json_object_get( res_val, "job" );
+      if ( job && json_is_object(job) )
+      {
+         // This is a Neptune job notification - handle it
+         extern bool neptune_handle_job_result(json_t *result);
+         ret = neptune_handle_job_result( res_val );
+         goto out;
+      }
+   }
+
    id_val = json_object_get( val, "id" );
 	if ( !id_val || json_is_null(id_val) )
 		goto out;
 
    err_val = json_object_get( val, "error" );
 
-   if ( !res_val || json_integer_value( id_val ) < 4 )
+   // Handle share submission responses (id >= 4)
+   int response_id = json_integer_value( id_val );
+   if ( !res_val || response_id < 4 )
       goto out;
+   
+   // Neptune shares use id=4
+   if ( opt_algo == ALGO_NEPTUNE && response_id == 4 )
+   {
+      share_accepted = json_is_true( res_val );
+      if (share_accepted) {
+         applog(LOG_NOTICE, "Neptune: Share ACCEPTED by pool!");
+      } else {
+         const char *err_msg = err_val ? json_string_value( json_array_get(err_val, 1) ) : "unknown error";
+         applog(LOG_WARNING, "Neptune: Share REJECTED: %s", err_msg);
+      }
+      share_result( share_accepted, NULL, err_val ?
+                    json_string_value( json_array_get(err_val, 1) ) : NULL );
+      ret = true;
+      goto out;
+   }
+   
+   // Standard share handling for other algos
    share_accepted = json_is_true( res_val );
    share_result( share_accepted, NULL, err_val ?
                  json_string_value( json_array_get(err_val, 1) ) : NULL );

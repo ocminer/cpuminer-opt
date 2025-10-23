@@ -612,6 +612,7 @@ enum algos {
         ALGO_MINOTAUR,
         ALGO_MINOTAURX,
         ALGO_MYR_GR,      
+        ALGO_NEPTUNE,
         ALGO_NEOSCRYPT,
         ALGO_NIST5,       
         ALGO_PENTABLAKE,  
@@ -709,6 +710,7 @@ static const char* const algo_names[] = {
         "minotaur",
         "minotaurx",
         "myr-gr",
+        "neptune",
         "neoscrypt",
         "nist5",
         "pentablake",
@@ -871,6 +873,7 @@ Options:\n\
                           myr-gr        Myriad-Groestl\n\
                           minotaur\n\
                           minotaurx\n\
+                          neptune       Neptune (Tip5 quantum-resistant hash)\n\
                           neoscrypt     NeoScrypt(128, 2, 1)\n\
                           nist5         Nist5\n\
                           pentablake    5 x blake512\n\
@@ -1058,4 +1061,3 @@ static struct option const options[] = {
 
 
 #endif /* __MINER_H__ */
-
