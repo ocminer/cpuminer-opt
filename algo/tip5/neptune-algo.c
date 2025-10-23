@@ -15,6 +15,9 @@
 #include <time.h>
 #include <pthread.h>
 
+// External references
+extern struct stratum_ctx stratum;
+
 // Neptune job structure
 typedef struct {
     char job_id[64];
@@ -418,11 +421,6 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
     const uint64_t first_nonce = nonce;
     CDigest hash;  // Using tip5xx wrapper type
     
-    if (thr_id < 4) {
-        applog(LOG_NOTICE, "Neptune: Thread %d scanhash START with nonce=0x%016lx (data[20]=%u, data[19]=%u)",
-               thr_id, nonce, work->data[20], work->data[19]);
-    }
-    
     // Check if we have an active job
     pthread_mutex_lock(&job_lock);
     
@@ -476,27 +474,31 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
     // We only stop on work_restart signal
     while (!work_restart[thr_id].restart) {
         
-        // Debug: Show what we're hashing for specific nonce
-        if (nonce == 4563 && thr_id == 0) {
-            applog(LOG_INFO, "Neptune: [DEBUG] Hashing nonce %lu, paths_len=%zu", nonce, paths_len);
-            // Show first 40 bytes of paths
-            char hex[81];
-            for (int i = 0; i < 40 && i < paths_len; i++) {
-                sprintf(hex + (i*2), "%02x", paths_buffer[i]);
-            }
-            hex[80] = '\0';
-            applog(LOG_INFO, "  First 40 bytes of paths: %s", hex);
-        }
-        
-        // Create nonce digest (40 bytes: nonce as first u64, rest zeros)
-        // IMPORTANT: Only hash the LOWER 32 bits (local nonce)
-        // Upper 32 bits (extranonce2/thread ID) are for pool tracking only
+        // Create full nonce digest (40 bytes) with ExtraNonce support
+        // Layout: [nonce32, extranonce2, extranonce1, zeros...]
+        // This matches the pool's createFullNonceDigest function
         uint8_t nonce_digest[40] = {0};
         uint32_t local_nonce = (uint32_t)(nonce & 0xFFFFFFFF);
-        for (int i = 0; i < 4; i++) {
-            nonce_digest[i] = (local_nonce >> (i * 8)) & 0xFF;
+        uint32_t extranonce2 = (uint32_t)(nonce >> 32);  // Thread ID in upper bits
+        
+        // Get extranonce1 from stratum context (pool-assigned)
+        // xnonce1 comes as hex bytes, need to handle endianness correctly
+        uint32_t extranonce1 = 0;
+        if (stratum.xnonce1 && stratum.xnonce1_size >= 4) {
+            // Read 4 bytes in big-endian order (network byte order)
+            unsigned char *en1_bytes = stratum.xnonce1;
+            extranonce1 = ((uint32_t)en1_bytes[0] << 24) |
+                         ((uint32_t)en1_bytes[1] << 16) |
+                         ((uint32_t)en1_bytes[2] << 8) |
+                         ((uint32_t)en1_bytes[3]);
         }
-        // Rest stays zero (bytes 4-39)
+        
+        // Write as little-endian 32-bit values  
+        uint32_t *digest32 = (uint32_t *)nonce_digest;
+        digest32[0] = htole32(local_nonce);   // Bytes 0-3: nonce
+        digest32[1] = htole32(extranonce2);   // Bytes 4-7: extranonce2
+        digest32[2] = htole32(extranonce1);   // Bytes 8-11: extranonce1
+        // digest32[3-9] already zero from memset
         
         // Compute hash using tip5xx library wrapper
         tip5xx_hash_block_pow(paths_buffer, paths_len, nonce_digest, &hash);
@@ -661,21 +663,22 @@ bool neptune_update_difficulty(uint32_t difficulty) {
 void neptune_build_stratum_request(char *req, struct work *work, struct stratum_ctx *sctx)
 {
     // Reconstruct full nonce from two 32-bit fields
-    // For Neptune: data[20] is unused, data[19] is the actual nonce
     uint64_t full_nonce = ((uint64_t)work->data[20] << 32) | work->data[19];
-    uint32_t local_nonce = work->data[19];  // The actual nonce value
     
-    // Use fixed extranonce2 (all threads use same value since nonces don't overlap)
-    char xnonce2_hex[9];
-    snprintf(xnonce2_hex, sizeof(xnonce2_hex), "00000000");
+    // Extract components for Neptune protocol
+    uint32_t local_nonce = (uint32_t)(full_nonce & 0xFFFFFFFF);    // Lower 32 bits
+    uint32_t extranonce2 = (uint32_t)(full_nonce >> 32);           // Upper 32 bits (thread ID)
     
-    char ntime_hex[9], nonce_hex[9];
+    char ntime_hex[9], nonce_hex[9], xnonce2_hex[9];
     
     // ntime - current unix timestamp
     snprintf(ntime_hex, sizeof(ntime_hex), "%08x", (uint32_t)time(NULL));
     
-    // nonce - the actual 32-bit nonce value
+    // nonce - the local 32-bit nonce value
     snprintf(nonce_hex, sizeof(nonce_hex), "%08x", local_nonce);
+    
+    // extranonce2 - thread-specific value from upper nonce bits
+    snprintf(xnonce2_hex, sizeof(xnonce2_hex), "%08x", extranonce2);
     
     pthread_mutex_lock(&job_lock);
     
@@ -768,17 +771,15 @@ void neptune_get_new_work(struct work *work, struct work *g_work,
             work->data[19] = (uint32_t)(saved_nonce & 0xFFFFFFFF);
             work->data[20] = (uint32_t)(saved_nonce >> 32);
         } else {
-            // Divide 32-bit nonce space among threads
-            // Each thread gets: (0xFFFFFFFF / num_threads) * thread_id
-            // This ensures no overlap in actual nonce values
-            uint32_t nonce_per_thread = 0xFFFFFFFF / opt_n_threads;
-            uint32_t start_nonce = nonce_per_thread * thr_id;
+            // Use thread ID as extranonce2 (upper 32 bits of 64-bit nonce)
+            // Each thread searches its own space: (thr_id << 32) + [0 to 4B]
+            work->data[19] = 0;           // Lower 32 bits start at 0
+            work->data[20] = thr_id;      // Upper 32 bits = thread ID (extranonce2)
             
-            work->data[19] = start_nonce;     // Start at thread-specific offset
-            work->data[20] = 0;               // Don't use upper bits
-            
-            applog(LOG_NOTICE, "Neptune: Thread %d initialized with start_nonce=0x%08x (range: 0x%08x to 0x%08x)",
-                   thr_id, start_nonce, start_nonce, start_nonce + nonce_per_thread);
+            if (opt_debug) {
+                applog(LOG_DEBUG, "Neptune: Thread %d initialized with extranonce2=%u",
+                       thr_id, thr_id);
+            }
         }
         
         pthread_mutex_unlock(&job_lock);
