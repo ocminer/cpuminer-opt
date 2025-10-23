@@ -2213,7 +2213,15 @@ static void *miner_thread( void *userdata )
           if ( unlikely( ( *nonceptr >= end_nonce )
                         && !work_restart[thr_id].restart ) )
           {
-             if ( opt_extranonce )
+             // Neptune handles its own work generation
+             if ( opt_algo == ALGO_NEPTUNE )
+             {
+                if ( !thr_id )
+                   applog( LOG_DEBUG, "Neptune: Nonce range exhausted, waiting for new work..." );
+                while ( !work_restart[thr_id].restart )
+                   usleep( 100000 );
+             }
+             else if ( opt_extranonce )
                 stratum_gen_work( &stratum, &g_work );
              else
              {
@@ -4012,4 +4020,3 @@ int main(int argc, char *argv[])
 	applog( LOG_WARNING, "workio thread dead, exiting." );
 	return 0;
 }
-

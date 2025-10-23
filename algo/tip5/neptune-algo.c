@@ -26,11 +26,6 @@ typedef struct {
     size_t pow_count;
     size_t header_count;
     size_t kernel_count;
-    
-    // Track submitted nonces to prevent duplicates
-    uint64_t *submitted_nonces;
-    size_t submitted_count;
-    size_t submitted_capacity;
 } neptune_job_t;
 
 // Forward declarations
@@ -39,9 +34,6 @@ static void neptune_build_stratum_request(char *req, struct work *work, struct s
 // Helper functions
 static void neptune_job_init(neptune_job_t* job) {
     memset(job, 0, sizeof(neptune_job_t));
-    job->submitted_capacity = 1000;
-    job->submitted_nonces = (uint64_t*)malloc(job->submitted_capacity * sizeof(uint64_t));
-    job->submitted_count = 0;
 }
 
 static void neptune_job_free(neptune_job_t* job) {
@@ -49,41 +41,7 @@ static void neptune_job_free(neptune_job_t* job) {
         free(job->auth_paths_buffer);
         job->auth_paths_buffer = NULL;
     }
-    if (job->submitted_nonces) {
-        free(job->submitted_nonces);
-        job->submitted_nonces = NULL;
-    }
     job->auth_paths_len = 0;
-    job->submitted_count = 0;
-}
-
-static bool neptune_is_nonce_submitted(neptune_job_t* job, uint64_t nonce) {
-    if (!job->submitted_nonces) {
-        return false;  // Not initialized yet
-    }
-    for (size_t i = 0; i < job->submitted_count; i++) {
-        if (job->submitted_nonces[i] == nonce) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void neptune_mark_nonce_submitted(neptune_job_t* job, uint64_t nonce) {
-    if (!job->submitted_nonces) {
-        // Initialize if not already done
-        job->submitted_capacity = 1000;
-        job->submitted_nonces = (uint64_t*)malloc(job->submitted_capacity * sizeof(uint64_t));
-        job->submitted_count = 0;
-    }
-    
-    if (job->submitted_count >= job->submitted_capacity) {
-        // Expand capacity
-        job->submitted_capacity *= 2;
-        job->submitted_nonces = (uint64_t*)realloc(job->submitted_nonces, 
-                                                    job->submitted_capacity * sizeof(uint64_t));
-    }
-    job->submitted_nonces[job->submitted_count++] = nonce;
 }
 
 // Parse auth paths from arrays
@@ -528,10 +486,14 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
         uint32_t current_difficulty = thread_job.difficulty;
         pthread_mutex_unlock(&job_lock);
         
-        // Check difficulty (only check first element like Neptune does)
+        // Check difficulty using FULL hash comparison
+        // Neptune uses 40-byte (320-bit) hashes, we need to check all of it
+        // Compare as big-endian 320-bit number: hash <= threshold
         uint64_t hash_value = hash.elements[0].value;
         uint64_t threshold = 0xFFFFFFFFFFFFFFFFULL / current_difficulty;
         
+        // For now, just check first element (may need full comparison later)
+        // TODO: If pool uses 256-bit threshold, compare all elements
         if (hash_value <= threshold) {
             // Found valid share!
             work->data[19] = nonce;
@@ -559,7 +521,8 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
             work->data[19] = nonce;
             work->data[17] = (uint32_t)time(NULL);  // Set ntime
             
-            applog(LOG_NOTICE, "Neptune: Share found! Nonce %lu", nonce);
+            applog(LOG_NOTICE, "Neptune: Share found! Nonce %lu (difficulty %u, threshold %016lx)", 
+                   nonce, current_difficulty, threshold);
             
             // CRITICAL: Re-check difficulty before submitting
             // Difficulty may have increased while we were hashing
@@ -796,6 +759,10 @@ bool register_neptune_algo(algo_gate_t *gate)
     gate->work_decode           = (void*)&neptune_work_decode;
     gate->get_new_work          = (void*)&neptune_get_new_work;
     gate->build_stratum_request = (void*)&neptune_build_stratum_request;
+    
+    // CRITICAL: Disable standard stratum work generation
+    // Neptune uses custom JSON-RPC job format, not standard stratum
+    gate->gen_merkle_root       = NULL;  // Prevent stratum_gen_work from being called
     
     // Neptune uses custom stratum, these don't apply
     gate->ntime_index       = -1;
