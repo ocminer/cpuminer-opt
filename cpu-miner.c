@@ -2210,16 +2210,16 @@ static void *miner_thread( void *userdata )
        {
           while ( unlikely( stratum_down ) )
              sleep( 1 );
+          // Check for nonce exhaustion
           if ( unlikely( ( *nonceptr >= end_nonce )
                         && !work_restart[thr_id].restart ) )
           {
-             // Neptune handles its own work generation
+             // Neptune uses 64-bit nonce space, doesn't exhaust
              if ( opt_algo == ALGO_NEPTUNE )
              {
-                if ( !thr_id )
-                   applog( LOG_DEBUG, "Neptune: Nonce range exhausted, waiting for new work..." );
-                while ( !work_restart[thr_id].restart )
-                   usleep( 100000 );
+                // Continue mining, Neptune manages its own 64-bit nonce space
+                // across work->data[19] and work->data[20]
+                continue;
              }
              else if ( opt_extranonce )
                 stratum_gen_work( &stratum, &g_work );

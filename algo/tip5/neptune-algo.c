@@ -19,6 +19,7 @@
 typedef struct {
     char job_id[64];
     uint32_t difficulty;
+    uint64_t threshold;  // First 64 bits of pool's 256-bit threshold
     bool clean_jobs;
     
     uint8_t* auth_paths_buffer;
@@ -243,6 +244,11 @@ bool neptune_handle_job_result(json_t *result)
         return false;
     }
     
+    // Calculate threshold from difficulty
+    // Note: Pool sends 256-bit threshold, but parsing it correctly requires
+    // proper byte order handling. For now, calculate from difficulty.
+    uint64_t threshold = 0xFFFFFFFFFFFFFFFFULL / difficulty;
+    
     // Get paths object
     json_t *paths = json_object_get(job, "paths");
     if (!paths || !json_is_object(paths)) {
@@ -294,6 +300,7 @@ bool neptune_handle_job_result(json_t *result)
     strncpy(thread_job.job_id, job_id, sizeof(thread_job.job_id) - 1);
     thread_job.job_id[sizeof(thread_job.job_id) - 1] = '\0';
     thread_job.difficulty = difficulty;
+    thread_job.threshold = threshold;  // Store pool's threshold
     thread_job.clean_jobs = true;  // Always treat as clean for new jobs
     
     // Parse auth paths into job structure
@@ -405,9 +412,16 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
                     uint64_t *hashes_done, struct thr_info *mythr)
 {
     const int thr_id = mythr->id;
-    uint64_t nonce = work->data[19];  // Starting nonce
+    // Reconstruct 64-bit nonce from two 32-bit fields
+    // data[19] = lower 32 bits, data[20] = upper 32 bits (extranonce2)
+    uint64_t nonce = ((uint64_t)work->data[20] << 32) | work->data[19];
     const uint64_t first_nonce = nonce;
     CDigest hash;  // Using tip5xx wrapper type
+    
+    if (thr_id < 4) {
+        applog(LOG_NOTICE, "Neptune: Thread %d scanhash START with nonce=0x%016lx (data[20]=%u, data[19]=%u)",
+               thr_id, nonce, work->data[20], work->data[19]);
+    }
     
     // Check if we have an active job
     pthread_mutex_lock(&job_lock);
@@ -458,7 +472,9 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
     }
     
     // Mining loop
-    while (nonce < max_nonce && !work_restart[thr_id].restart) {
+    // Neptune uses 64-bit nonce space, ignore 32-bit max_nonce limit
+    // We only stop on work_restart signal
+    while (!work_restart[thr_id].restart) {
         
         // Debug: Show what we're hashing for specific nonce
         if (nonce == 4563 && thr_id == 0) {
@@ -473,30 +489,36 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
         }
         
         // Create nonce digest (40 bytes: nonce as first u64, rest zeros)
+        // IMPORTANT: Only hash the LOWER 32 bits (local nonce)
+        // Upper 32 bits (extranonce2/thread ID) are for pool tracking only
         uint8_t nonce_digest[40] = {0};
-        for (int i = 0; i < 8; i++) {
-            nonce_digest[i] = (nonce >> (i * 8)) & 0xFF;
+        uint32_t local_nonce = (uint32_t)(nonce & 0xFFFFFFFF);
+        for (int i = 0; i < 4; i++) {
+            nonce_digest[i] = (local_nonce >> (i * 8)) & 0xFF;
         }
+        // Rest stays zero (bytes 4-39)
         
         // Compute hash using tip5xx library wrapper
         tip5xx_hash_block_pow(paths_buffer, paths_len, nonce_digest, &hash);
         
-        // Re-read current difficulty (may have changed via vardiff)
+        // Re-read current difficulty and threshold (may have changed via vardiff)
         pthread_mutex_lock(&job_lock);
         uint32_t current_difficulty = thread_job.difficulty;
+        uint64_t threshold = thread_job.threshold;  // Use pool's threshold
         pthread_mutex_unlock(&job_lock);
         
         // Check difficulty using FULL hash comparison
         // Neptune uses 40-byte (320-bit) hashes, we need to check all of it
         // Compare as big-endian 320-bit number: hash <= threshold
         uint64_t hash_value = hash.elements[0].value;
-        uint64_t threshold = 0xFFFFFFFFFFFFFFFFULL / current_difficulty;
         
         // For now, just check first element (may need full comparison later)
         // TODO: If pool uses 256-bit threshold, compare all elements
         if (hash_value <= threshold) {
             // Found valid share!
-            work->data[19] = nonce;
+            // Store nonce in work structure (split across two 32-bit fields)
+            work->data[19] = (uint32_t)(nonce & 0xFFFFFFFF);  // Lower 32 bits
+            work->data[20] = (uint32_t)(nonce >> 32);          // Upper 32 bits
             
             // Convert Digest to byte array for submission
             uint8_t hash_bytes[40];  // 5 BFieldElements × 8 bytes each
@@ -518,11 +540,13 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
             }
             
             // Found a valid share!
-            work->data[19] = nonce;
+            work->data[19] = (uint32_t)(nonce & 0xFFFFFFFF);
+            work->data[20] = (uint32_t)(nonce >> 32);
             work->data[17] = (uint32_t)time(NULL);  // Set ntime
             
-            applog(LOG_NOTICE, "Neptune: Share found! Nonce %lu (difficulty %u, threshold %016lx)", 
-                   nonce, current_difficulty, threshold);
+            applog(LOG_NOTICE, "Neptune: Share found! Nonce %lu (0x%lx) [extranonce2=0x%08x, local=0x%08x] (difficulty %u, threshold %016lx)", 
+                   nonce, nonce, (uint32_t)(nonce >> 32), (uint32_t)(nonce & 0xFFFFFFFF),
+                   current_difficulty, threshold);
             
             // CRITICAL: Re-check difficulty before submitting
             // Difficulty may have increased while we were hashing
@@ -598,7 +622,8 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
     
     free(paths_buffer);
     *hashes_done = nonce - first_nonce;
-    work->data[19] = nonce;
+    work->data[19] = (uint32_t)(nonce & 0xFFFFFFFF);
+    work->data[20] = (uint32_t)(nonce >> 32);
     
     return 0;
 }
@@ -635,24 +660,34 @@ bool neptune_update_difficulty(uint32_t difficulty) {
  */
 void neptune_build_stratum_request(char *req, struct work *work, struct stratum_ctx *sctx)
 {
+    // Reconstruct full nonce from two 32-bit fields
+    // For Neptune: data[20] is unused, data[19] is the actual nonce
+    uint64_t full_nonce = ((uint64_t)work->data[20] << 32) | work->data[19];
+    uint32_t local_nonce = work->data[19];  // The actual nonce value
+    
+    // Use fixed extranonce2 (all threads use same value since nonces don't overlap)
+    char xnonce2_hex[9];
+    snprintf(xnonce2_hex, sizeof(xnonce2_hex), "00000000");
+    
     char ntime_hex[9], nonce_hex[9];
-    uint32_t nonce_le = work->data[19];  // Little-endian nonce (u32)
     
     // ntime - current unix timestamp
     snprintf(ntime_hex, sizeof(ntime_hex), "%08x", (uint32_t)time(NULL));
     
-    // nonce - just the simple hex value (8 chars for u32)
-    snprintf(nonce_hex, sizeof(nonce_hex), "%08x", nonce_le);
+    // nonce - the actual 32-bit nonce value
+    snprintf(nonce_hex, sizeof(nonce_hex), "%08x", local_nonce);
     
     pthread_mutex_lock(&job_lock);
     
     const char *username = rpc_user ? rpc_user : "";
     
-    // Build standard 5-param stratum submit (like test-miner)
+    // Build standard 5-param stratum submit
+    // Neptune: all threads use same extranonce2, different nonce ranges
     snprintf(req, 8192,
-        "{\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"00000000\",\"%s\",\"%s\"],\"id\":4}\n",
+        "{\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"],\"id\":4}\n",
         username,
         thread_job.job_id,
+        xnonce2_hex,  // Fixed "00000000"
         ntime_hex,
         nonce_hex);
     
@@ -723,15 +758,27 @@ void neptune_get_new_work(struct work *work, struct work *g_work,
     // Check if we have a job
     if (thread_job.auth_paths_buffer && thread_job.auth_paths_len > 0) {
         // We have a job - set up work structure
-        uint32_t saved_nonce = work->data[19];  // Save current nonce
+        // Save current 64-bit nonce (split across two 32-bit fields)
+        uint64_t saved_nonce = ((uint64_t)work->data[20] << 32) | work->data[19];
         memset(work, 0, sizeof(struct work));
         
         // Restore nonce to continue from where we left off
         // Only reset to thread starting position if nonce is 0 (first time/new job)
         if (saved_nonce != 0) {
-            work->data[19] = saved_nonce;  // Continue from saved position
+            work->data[19] = (uint32_t)(saved_nonce & 0xFFFFFFFF);
+            work->data[20] = (uint32_t)(saved_nonce >> 32);
         } else {
-            work->data[19] = thr_id * 0x10000000;  // Initial nonce for this thread
+            // Divide 32-bit nonce space among threads
+            // Each thread gets: (0xFFFFFFFF / num_threads) * thread_id
+            // This ensures no overlap in actual nonce values
+            uint32_t nonce_per_thread = 0xFFFFFFFF / opt_n_threads;
+            uint32_t start_nonce = nonce_per_thread * thr_id;
+            
+            work->data[19] = start_nonce;     // Start at thread-specific offset
+            work->data[20] = 0;               // Don't use upper bits
+            
+            applog(LOG_NOTICE, "Neptune: Thread %d initialized with start_nonce=0x%08x (range: 0x%08x to 0x%08x)",
+                   thr_id, start_nonce, start_nonce, start_nonce + nonce_per_thread);
         }
         
         pthread_mutex_unlock(&job_lock);
