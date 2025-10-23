@@ -2782,6 +2782,42 @@ static void *stratum_thread(void *userdata )
          if ( likely( s = stratum_recv_line( &stratum ) ) )
          {
             stratum_down = false;
+            
+            // Neptune: Handle difficulty notifications before standard stratum
+            if ( opt_algo == ALGO_NEPTUNE )
+            {
+               json_error_t err;
+               json_t *val = JSON_LOADS( s, &err );
+               if ( val )
+               {
+                  json_t *method = json_object_get( val, "method" );
+                  if ( method && json_is_string(method) )
+                  {
+                     const char *method_str = json_string_value(method);
+                     if ( strcmp(method_str, "mining.set_difficulty") == 0 )
+                     {
+                        json_t *params = json_object_get( val, "params" );
+                        if ( params && json_is_array(params) && json_array_size(params) > 0 )
+                        {
+                           json_t *diff_val = json_array_get( params, 0 );
+                           uint32_t new_diff = (uint32_t)json_integer_value(diff_val);
+                           
+                           extern bool neptune_update_difficulty(uint32_t difficulty);
+                           if ( neptune_update_difficulty(new_diff) )
+                           {
+                              if ( !opt_quiet )
+                                 applog(LOG_NOTICE, "Neptune: Difficulty updated to %u", new_diff);
+                           }
+                           json_decref(val);
+                           free( s );
+                           continue; // Skip standard handling
+                        }
+                     }
+                  }
+                  json_decref(val);
+               }
+            }
+            
             if ( likely( !stratum_handle_method( &stratum, s ) ) )
                stratum_handle_response( s );
             free( s );
@@ -3976,3 +4012,4 @@ int main(int argc, char *argv[])
 	applog( LOG_WARNING, "workio thread dead, exiting." );
 	return 0;
 }
+

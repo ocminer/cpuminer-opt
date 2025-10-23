@@ -26,6 +26,11 @@ typedef struct {
     size_t pow_count;
     size_t header_count;
     size_t kernel_count;
+    
+    // Track submitted nonces to prevent duplicates
+    uint64_t *submitted_nonces;
+    size_t submitted_count;
+    size_t submitted_capacity;
 } neptune_job_t;
 
 // Forward declarations
@@ -34,6 +39,9 @@ static void neptune_build_stratum_request(char *req, struct work *work, struct s
 // Helper functions
 static void neptune_job_init(neptune_job_t* job) {
     memset(job, 0, sizeof(neptune_job_t));
+    job->submitted_capacity = 1000;
+    job->submitted_nonces = (uint64_t*)malloc(job->submitted_capacity * sizeof(uint64_t));
+    job->submitted_count = 0;
 }
 
 static void neptune_job_free(neptune_job_t* job) {
@@ -41,7 +49,41 @@ static void neptune_job_free(neptune_job_t* job) {
         free(job->auth_paths_buffer);
         job->auth_paths_buffer = NULL;
     }
+    if (job->submitted_nonces) {
+        free(job->submitted_nonces);
+        job->submitted_nonces = NULL;
+    }
     job->auth_paths_len = 0;
+    job->submitted_count = 0;
+}
+
+static bool neptune_is_nonce_submitted(neptune_job_t* job, uint64_t nonce) {
+    if (!job->submitted_nonces) {
+        return false;  // Not initialized yet
+    }
+    for (size_t i = 0; i < job->submitted_count; i++) {
+        if (job->submitted_nonces[i] == nonce) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void neptune_mark_nonce_submitted(neptune_job_t* job, uint64_t nonce) {
+    if (!job->submitted_nonces) {
+        // Initialize if not already done
+        job->submitted_capacity = 1000;
+        job->submitted_nonces = (uint64_t*)malloc(job->submitted_capacity * sizeof(uint64_t));
+        job->submitted_count = 0;
+    }
+    
+    if (job->submitted_count >= job->submitted_capacity) {
+        // Expand capacity
+        job->submitted_capacity *= 2;
+        job->submitted_nonces = (uint64_t*)realloc(job->submitted_nonces, 
+                                                    job->submitted_capacity * sizeof(uint64_t));
+    }
+    job->submitted_nonces[job->submitted_count++] = nonce;
 }
 
 // Parse auth paths from arrays
@@ -438,6 +480,10 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
     // Copy job data for mining (to avoid holding lock)
     uint32_t difficulty = thread_job.difficulty;
     size_t paths_len = thread_job.auth_paths_len;
+    char current_job_id[64];
+    strncpy(current_job_id, thread_job.job_id, sizeof(current_job_id) - 1);
+    current_job_id[sizeof(current_job_id) - 1] = '\0';
+    
     uint8_t *paths_buffer = (uint8_t*)malloc(paths_len);
     if (!paths_buffer) {
         pthread_mutex_unlock(&job_lock);
@@ -477,9 +523,14 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
         // Compute hash using tip5xx library wrapper
         tip5xx_hash_block_pow(paths_buffer, paths_len, nonce_digest, &hash);
         
+        // Re-read current difficulty (may have changed via vardiff)
+        pthread_mutex_lock(&job_lock);
+        uint32_t current_difficulty = thread_job.difficulty;
+        pthread_mutex_unlock(&job_lock);
+        
         // Check difficulty (only check first element like Neptune does)
         uint64_t hash_value = hash.elements[0].value;
-        uint64_t threshold = 0xFFFFFFFFFFFFFFFFULL / difficulty;
+        uint64_t threshold = 0xFFFFFFFFFFFFFFFFULL / current_difficulty;
         
         if (hash_value <= threshold) {
             // Found valid share!
@@ -509,6 +560,38 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
             work->data[17] = (uint32_t)time(NULL);  // Set ntime
             
             applog(LOG_NOTICE, "Neptune: Share found! Nonce %lu", nonce);
+            
+            // CRITICAL: Re-check difficulty before submitting
+            // Difficulty may have increased while we were hashing
+            pthread_mutex_lock(&job_lock);
+            uint32_t submit_difficulty = thread_job.difficulty;
+            
+            // CRITICAL: Verify job hasn't changed!
+            // If job changed, this share was found with old auth_paths and is invalid
+            if (strcmp(current_job_id, thread_job.job_id) != 0) {
+                pthread_mutex_unlock(&job_lock);
+                if (opt_debug) {
+                    applog(LOG_DEBUG, "Neptune: Share found but job changed (%s -> %s), discarding", 
+                           current_job_id, thread_job.job_id);
+                }
+                // Job changed - abort this mining round
+                break;
+            }
+            
+            pthread_mutex_unlock(&job_lock);
+            
+            // Recalculate threshold with current difficulty
+            uint64_t submit_threshold = 0xFFFFFFFFFFFFFFFFULL / submit_difficulty;
+            
+            if (hash_value > submit_threshold) {
+                // Share no longer meets current difficulty - skip it
+                if (opt_debug) {
+                    applog(LOG_DEBUG, "Neptune: Share nonce %lu discarded (difficulty increased to %u)", 
+                           nonce, submit_difficulty);
+                }
+                nonce++;
+                continue;
+            }
             
             // Build submission using our proper function
             char submit_msg[8192];
@@ -555,6 +638,31 @@ int scanhash_neptune(struct work *work, uint32_t max_nonce,
     work->data[19] = nonce;
     
     return 0;
+}
+
+/**
+ * Update difficulty (called when pool sends mining.set_difficulty)
+ */
+bool neptune_update_difficulty(uint32_t difficulty) {
+    pthread_mutex_lock(&job_lock);
+    
+    uint32_t old_diff = thread_job.difficulty;
+    
+    if (old_diff != difficulty) {
+        thread_job.difficulty = difficulty;
+        
+        if (opt_debug) {
+            applog(LOG_DEBUG, "Neptune: Difficulty changed %u -> %u", old_diff, difficulty);
+        }
+        
+        pthread_mutex_unlock(&job_lock);
+        
+        // Don't restart threads - they will pick up new difficulty on next share check
+        return true;
+    }
+    
+    pthread_mutex_unlock(&job_lock);
+    return false;
 }
 
 /**
@@ -652,10 +760,16 @@ void neptune_get_new_work(struct work *work, struct work *g_work,
     // Check if we have a job
     if (thread_job.auth_paths_buffer && thread_job.auth_paths_len > 0) {
         // We have a job - set up work structure
+        uint32_t saved_nonce = work->data[19];  // Save current nonce
         memset(work, 0, sizeof(struct work));
         
-        // Set initial nonce (different for each thread to avoid collisions)
-        work->data[19] = thr_id * 0x10000000;
+        // Restore nonce to continue from where we left off
+        // Only reset to thread starting position if nonce is 0 (first time/new job)
+        if (saved_nonce != 0) {
+            work->data[19] = saved_nonce;  // Continue from saved position
+        } else {
+            work->data[19] = thr_id * 0x10000000;  // Initial nonce for this thread
+        }
         
         pthread_mutex_unlock(&job_lock);
         
